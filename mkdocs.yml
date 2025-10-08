@@ -1,0 +1,18 @@
+site_name: "LeRobot"
+
+plugins:
+  - search
+  - with-pdf:
+      output_path: lerobot_documentation.pdf
+  - mkdocstrings:
+      handlers:
+        python:
+          load_external_modules: true
+          options:
+            members_order: source
+            show_source: false
+
+theme: readthedocs
+
+docs_dir: "src_docs/src"
+site_dir: "src_docs/site"

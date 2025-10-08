@@ -1,0 +1,3 @@
+# Camera
+
+::: lerobot.cameras.camera
