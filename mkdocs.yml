@@ -1,12 +1,9 @@
 site_name: "LeRobot"
-<<<<<<< HEAD
-=======
 nav:
   - index.md
-  - hardware.md
-  - policies.md
->>>>>>> 5a5ab0b (add: settings of mkdocs)
-
+  - script_sequences.md
+  - hardware_interfaces.md
+  - policy_interfaces.md
 plugins:
   - search
   - with-pdf:
@@ -18,8 +15,25 @@ plugins:
           options:
             members_order: source
             show_source: false
+  - kroki:
+      FencePrefix: ""
+      FileTypeOverrides:
+        mermaid: png
 
 theme: readthedocs
 
 docs_dir: "src_docs/src"
 site_dir: "src_docs/site"
+
+markdown_extensions:
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_div_format
+
+extra_css:
+  - https://unpkg.com/mermaid@11.12.0/dist/mermaid.css
+
+extra_javascript:
+  - https://unpkg.com/mermaid@11.12.0/dist/mermaid.min.js
