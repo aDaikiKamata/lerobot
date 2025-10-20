@@ -1,14 +1,24 @@
-# [scripts](https://github.com/aDaikiKamata/lerobot/tree/documentation-mkdocs/src/lerobot/scripts) のシーケンス
+# LeRobotの主なスクリプトでのI/Fの使われ方
 
-以下のI/Fが関連しています。
+[scripts/](https://github.com/huggingface/lerobot/tree/5c8dd883be7518a18fcee33a06418ea13026f8bf/src/lerobot/scripts) には実機のセットアップや動作記録や学習・推論を行うためのコマンドが用意されている.
 
-- `Robot`
-    - `Camera`
-    - `MotorsBus`
-- `Teleoperator`
-    - `MotorsBus`
+`Robot`, `TeleOperator`, `MotorBus` クラスがI/Fとして提供されており、実機固有の処理はこのクラスの実装として `robots/`, `teleoperators/` 以下に用意されている.
+[SO-101](https://huggingface.co/docs/lerobot/so101) を例として、コマンド毎にI/Fの使われ方を確認する.
 
-実装手順は [Bring Your Own Hardware](https://huggingface.co/docs/lerobot/integrate_hardware) も併せて参照してください。
+- セットアップ `lerobot_setup_motors`
+    - Robot(フォロワー), Teleoperator(リーダー) それぞれで行う
+- キャリブレーション `lerobot_calibrate`
+    - Robot(フォロワー), Teleoperator(リーダー) それぞれで行う
+    - フォロワーとリーダーにIDを指定する
+- 動作記録/推論 `lerobot_record`
+    - 動作記録
+        - Teleoperator: リーダー
+        - Robot: リーダーの動きに基づいて, フォロワーを遠隔操作する
+    - 推論
+        - PreTrainedPolicy: 学習済みのVLAモデル
+        - Robot: VLAモデルの出力に基づいて, フォロワーを制御する
+
+I/Fの実装手順は [Bring Your Own Hardware](https://huggingface.co/docs/lerobot/integrate_hardware) も併せて参照してください.
 
 ## セットアップ [`scripts/lerobot_setup_motors.py`](https://github.com/huggingface/lerobot/blob/5c8dd883be7518a18fcee33a06418ea13026f8bf/src/lerobot/scripts/lerobot_setup_motors.py)
 
@@ -68,9 +78,8 @@ sequenceDiagram
     box Follower
         participant Robot
         participant Camera
+        participant MotorBus
     end
-
-    participant Controller as V-Sido Bilateral
 
 
     note over CLI,Camera: 初期化
