@@ -1,3 +1,0 @@
-# Teleoperator
-
-::: lerobot.teleoperators.teleoperator

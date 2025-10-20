@@ -1,3 +1,0 @@
-# Robot
-
-::: lerobot.robots.robot

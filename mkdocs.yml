@@ -1,4 +1,11 @@
 site_name: "LeRobot"
+<<<<<<< HEAD
+=======
+nav:
+  - index.md
+  - hardware.md
+  - policies.md
+>>>>>>> 5a5ab0b (add: settings of mkdocs)
 
 plugins:
   - search
