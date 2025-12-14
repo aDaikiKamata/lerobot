@@ -195,7 +195,7 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def select_action(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
+    def select_action(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> tuple[Tensor, dict[str, Tensor] | None]:
         """Return one action to run in the environment (potentially in batch mode).
 
         When the model uses a history of observations, or outputs a sequence of actions, this method deals

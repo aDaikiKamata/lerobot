@@ -108,11 +108,11 @@ def predict_action(
 
         # Compute the next action with the policy
         # based on the current observation
-        action = policy.select_action(observation)
+        action, attention_maps = policy.select_action(observation)
 
         action = postprocessor(action)
 
-    return action
+    return action, attention_maps
 
 
 def init_keyboard_listener():

@@ -59,6 +59,7 @@ lerobot-record \
 """
 
 import logging
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -128,7 +129,6 @@ from lerobot.utils.utils import (
 )
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
-
 @dataclass
 class DatasetRecordConfig:
     # Dataset identifier. By convention it should match '{hf_username}/{dataset_name}' (e.g. `lerobot/test`).
@@ -187,6 +187,7 @@ class RecordConfig:
     play_sounds: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
+    include_attention_map: bool = True
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -257,6 +258,7 @@ def record_loop(
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
+    include_attention_map: bool = False,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -288,6 +290,7 @@ def record_loop(
         postprocessor.reset()
 
     timestamp = 0
+
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
@@ -307,7 +310,7 @@ def record_loop(
 
         # Get action from either policy or teleop
         if policy is not None and preprocessor is not None and postprocessor is not None:
-            action_values = predict_action(
+            action_values, attention_maps = predict_action(
                 observation=observation_frame,
                 policy=policy,
                 device=get_safe_torch_device(policy.config.device),
@@ -317,6 +320,13 @@ def record_loop(
                 task=single_task,
                 robot_type=robot.robot_type,
             )
+            if include_attention_map:
+                for key, attention_map in attention_maps.items():
+                    # Remove batch dimension if present: [1, 3, H, W] -> [3, H, W]
+                    if attention_map.dim() == 4 and attention_map.shape[0] == 1:
+                        attention_map = attention_map.squeeze(0)
+                    attention_map = attention_map.cpu().numpy()
+                    obs_processed[f'{key}'] = attention_map
 
             act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
 
@@ -465,6 +475,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 control_time_s=cfg.dataset.episode_time_s,
                 single_task=cfg.dataset.single_task,
                 display_data=cfg.display_data,
+                include_attention_map=cfg.include_attention_map,
             )
 
             # Execute a few seconds without recording to give time to manually reset the environment
@@ -484,6 +495,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     control_time_s=cfg.dataset.reset_time_s,
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
+                    include_attention_map=cfg.include_attention_map,
                 )
 
             if events["rerecord_episode"]:

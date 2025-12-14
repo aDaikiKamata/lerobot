@@ -58,6 +58,123 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
+def visualize_attention_on_image(
+    attention_weights: torch.Tensor,
+    image: torch.Tensor,
+    patch_size: int = 14,
+    image_size: tuple[int, int] = (224, 224),
+) -> torch.Tensor:
+    """
+    Overlay vision attention weights as a heatmap on the observation image.
+
+    Reference: https://github.com/villekuosmanen/physical-AI-interpretability/blob/main/src/attention_maps/act_attention_mapper.py#L151
+
+    Args:
+        attention_weights: Attention weights tensor of shape [B, num_heads, seq_len, seq_len]
+                          where seq_len = (image_size[0]//patch_size) * (image_size[1]//patch_size)
+                          For 224x224 with patch_size=14: [B, 16, 256, 256]
+        image: Input image tensor of shape [B, C, H, W] or [C, H, W]
+               Expected to be in range [0, 1] or [0, 255]
+        patch_size: Size of vision transformer patches (default: 14 for SigLIP)
+        image_size: Original image dimensions (H, W)
+
+    Returns:
+        Overlaid image tensor of shape [B, 3, H, W] or [3, H, W] with heatmap overlay
+    """
+    # Add batch dimension if needed
+    if image.dim() == 3:
+        image = image.unsqueeze(0)
+        squeeze_output = True
+    else:
+        squeeze_output = False
+
+    batch_size, channels, height, width = image.shape
+
+    # Normalize image to [0, 1] if needed
+    if image.max() > 1.0:
+        image = image / 255.0
+
+    # Get attention from CLS token (first token) to all patch tokens
+    # attention_weights: [B, num_heads, seq_len, seq_len]
+    # We average across heads and take attention from CLS token (index 0)
+    attention_map = attention_weights.mean(dim=1)[:, 0, :]  # [B, seq_len] (include all tokens)
+
+    # Calculate expected grid size
+    grid_h = image_size[0] // patch_size  # 224 // 14 = 16
+    grid_w = image_size[1] // patch_size  # 224 // 14 = 16
+    expected_patches = grid_h * grid_w  # 256
+
+    # Check if we need to exclude CLS token or if attention is already patch-only
+    actual_seq_len = attention_map.shape[1]
+    if actual_seq_len == expected_patches + 1:
+        # CLS token is included, exclude it
+        attention_map = attention_map[:, 1:]  # [B, 256]
+    elif actual_seq_len == expected_patches:
+        # Already patch-only, no need to exclude
+        pass
+    else:
+        raise ValueError(
+            f"Unexpected attention sequence length: {actual_seq_len}. "
+            f"Expected {expected_patches} (patches only) or {expected_patches + 1} (CLS + patches)"
+        )
+
+    # Reshape to 2D grid
+    attention_map = attention_map.reshape(batch_size, grid_h, grid_w)  # [B, 16, 16]
+
+    # Normalize attention map to [0, 1]
+    attention_map = attention_map - attention_map.min(dim=-1, keepdim=True)[0].min(dim=-2, keepdim=True)[0]
+    attention_map = attention_map / (attention_map.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0] + 1e-8)
+
+    # Resize attention map to match image size using bilinear interpolation
+    attention_map = attention_map.unsqueeze(1)  # [B, 1, 16, 16]
+    attention_map = F.interpolate(
+        attention_map,
+        size=(height, width),
+        mode='bilinear',
+        align_corners=False
+    )  # [B, 1, H, W]
+
+    # Apply colormap (jet colormap approximation)
+    # Convert grayscale attention to RGB heatmap
+    heatmap = apply_jet_colormap(attention_map.squeeze(1))  # [B, 3, H, W]
+
+    # Blend heatmap with original image (alpha blending)
+    alpha = 0.4  # Transparency of heatmap
+    overlaid = image * (1 - alpha) + heatmap * alpha
+    overlaid = torch.clamp(overlaid, 0, 1)
+
+    if squeeze_output:
+        overlaid = overlaid.squeeze(0)
+
+    return overlaid
+
+
+def apply_jet_colormap(gray: torch.Tensor) -> torch.Tensor:
+    """
+    Apply jet colormap to grayscale attention map.
+
+    Args:
+        gray: Grayscale tensor of shape [B, H, W] with values in [0, 1]
+
+    Returns:
+        RGB tensor of shape [B, 3, H, W] with jet colormap applied
+    """
+    # Jet colormap approximation
+    # Blue -> Cyan -> Green -> Yellow -> Red
+    batch_size, height, width = gray.shape
+    device = gray.device
+
+    # Create RGB channels
+    r = torch.clamp(4 * gray - 1.5, 0, 1)
+    g = torch.clamp(4 * torch.abs(gray - 0.5) - 0.5, 0, 1)
+    b = torch.clamp(-4 * gray + 2.5, 0, 1)
+
+    # Stack to create RGB image
+    rgb = torch.stack([r, g, b], dim=1)  # [B, 3, H, W]
+
+    return rgb
+
+
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "mps" and target_dtype == torch.float64:
@@ -402,8 +519,35 @@ class PaliGemmaWithExpertModel(
             if any(selector in name for selector in params_to_keep_float32):
                 param.data = param.data.to(dtype=torch.float32)
 
-    def embed_image(self, image: torch.Tensor):
-        return self.paligemma.model.get_image_features(image)
+    def embed_image(self, image: torch.Tensor, output_attentions: bool = False):
+        """
+        Embed images using vision tower.
+
+        Args:
+            image: Input images [B, C, H, W]
+            output_attentions: Whether to output attention weights from vision transformer
+
+        Returns:
+            Image embeddings [B, num_patches, hidden_dim]
+        """
+        # Note: get_image_features doesn't support output_attentions parameter
+        # We need to call vision_tower directly if we want attention weights
+        if output_attentions:
+            # Call vision tower with output_attentions=True
+            vision_outputs = self.paligemma.model.vision_tower(
+                image,
+                output_attentions=True,
+                output_hidden_states=False,
+            )
+            # vision_outputs is BaseModelOutputWithPooling when output_attentions=True
+            # vision_outputs.last_hidden_state: [B, num_patches, vision_hidden_dim]
+            # We need to apply the multi-modal projector to get the correct dimension
+            image_features = self.paligemma.model.multi_modal_projector(vision_outputs.last_hidden_state)
+        else:
+            # get_image_features applies both vision_tower and multi_modal_projector
+            image_features = self.paligemma.model.get_image_features(image)
+
+        return image_features
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)
@@ -525,6 +669,49 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             precision=config.dtype,
         )
 
+        # Setup vision attention hook for visualization
+        self.vision_attention_weights = None
+
+        def hook_vision_attention(module, input, output):
+            """
+            Capture attention weights from SigLIP Vision Transformer.
+
+            Note: SiglipAttention returns different outputs based on output_attentions flag:
+            - If output_attentions=False (default): returns only attn_output
+            - If output_attentions=True: returns (attn_output, attn_weights)
+
+            where attn_weights shape is [B, num_heads, seq_len, seq_len]
+            For 224x224 images with patch_size=14: seq_len = 256 (16x16 patches)
+
+            Since we cannot control output_attentions during forward pass easily,
+            we compute attention from the module's internal state if available,
+            or capture it from output if it's a tuple.
+            """
+            if isinstance(output, tuple) and len(output) > 1:
+                # output[1] contains attention weights: [B, num_heads, 256, 256]
+                self.vision_attention_weights = output[1].detach()
+                print(f"Captured vision attention weights: {self.vision_attention_weights.shape}")
+            else:
+                # Fallback: try to access attention weights from module's attributes
+                # Note: This may not work as SiglipAttention doesn't store attn_weights by default
+                if hasattr(module, 'attn_weights') and module.attn_weights is not None:
+                    self.vision_attention_weights = module.attn_weights.detach()
+                    print(f"Captured vision attention weights from module: {self.vision_attention_weights.shape}")
+                else:
+                    # Cannot capture attention weights without output_attentions=True
+                    print(f"Warning: Cannot capture attention weights. Output type: {type(output)}")
+
+        # Register hook on the last encoder layer's self-attention
+        # Path: paligemma.model.vision_tower.vision_model.encoder.layers[-1].self_attn
+        vision_encoder = self.paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder
+        last_layer = vision_encoder.layers[-1]
+        last_layer.self_attn.register_forward_hook(hook_vision_attention)
+
+        # To ensure attention weights are returned, we need to set output_attentions=True
+        # However, this needs to be done during forward pass via config or arguments
+        # For now, we store a flag to remind us to handle this
+        self._vision_output_attentions_needed = True
+
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
 
@@ -566,6 +753,24 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
         logging.info("Disabled gradient checkpointing for PI05Pytorch model")
+
+    def get_vision_attention_weights(self):
+        """
+        Get the captured vision attention weights from the last layer.
+
+        Returns:
+            torch.Tensor or None: Attention weights of shape [B, num_heads, seq_len, seq_len]
+                                  or None if not captured yet
+        """
+        return self.vision_attention_weights
+
+    def enable_vision_attention_capture(self):
+        """Enable capturing of vision attention weights during forward pass."""
+        self._vision_output_attentions_needed = True
+
+    def disable_vision_attention_capture(self):
+        """Disable capturing of vision attention weights during forward pass."""
+        self._vision_output_attentions_needed = False
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
@@ -609,11 +814,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
+            # img: (B, C, H, W) = (1, 3, 224, 224)
 
             def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
+                # Enable output_attentions if we want to capture vision attention
+                output_attentions = getattr(self, '_vision_output_attentions_needed', False)
+                return self.paligemma_with_expert.embed_image(img, output_attentions=output_attentions)
 
+            # img_emb: (B, 256, 2048)
+            # vlm_config_hf.vision_config.projection_dim = 2048
+            # GemmaConfig.head_dim = 256
             img_emb = self._apply_checkpoint(image_embed_func, img)
+            print(f'img.shape={img.shape}')
+            print(f'img_emb.shape={img_emb.shape}')
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
@@ -626,6 +839,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             lang_emb_dim = lang_emb.shape[-1]
             return lang_emb * math.sqrt(lang_emb_dim)
 
+        # lang_emb: (B, 200, 2048)
         lang_emb = self._apply_checkpoint(lang_embed_func, tokens)
         embs.append(lang_emb)
         pad_masks.append(masks)
@@ -633,6 +847,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
+        # embs: (B, 456, 2048)
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
@@ -884,6 +1099,18 @@ class PI05Policy(PreTrainedPolicy):
         # Initialize the core PI05 model
         self.init_rtc_processor()
         self.model = PI05Pytorch(config, rtc_processor=self.rtc_processor)
+
+        from torchinfo import summary
+
+        print(f"\nModel Configuration:")
+        print(f"  VLM Config: {config.paligemma_variant}")
+        print(f"  Action Expert Config: {config.action_expert_variant}")
+        print(f"  Precision: {config.dtype}")
+        print(f"  Max Action Dim: {config.max_action_dim}")
+        print(f"  Chunk Size: {config.chunk_size}")
+        print()
+
+        summary(self.model.paligemma_with_expert, depth=5)
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -1167,8 +1394,12 @@ class PI05Policy(PreTrainedPolicy):
         return actions
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        """Select a single action given environment observations."""
+    def select_action(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, Tensor] | None]:
+        """Select a single action given environment observations.
+
+        Returns:
+            tuple: (action, attention_maps) where attention_maps contains vision attention overlays if available
+        """
         assert not self._rtc_enabled(), (
             "RTC is not supported for select_action, use it with predict_action_chunk"
         )
@@ -1181,7 +1412,31 @@ class PI05Policy(PreTrainedPolicy):
             # Transpose to get shape (n_action_steps, batch_size, action_dim)
             self._action_queue.extend(actions.transpose(0, 1))
 
-        return self._action_queue.popleft()
+        # Get vision attention weights and create heatmap overlays if available
+        attention_maps = None
+        vision_attn = self.model.get_vision_attention_weights()
+        if vision_attn is not None:
+            attention_maps = {}
+
+            # Create heatmap overlay for each camera image
+            for img_key in self.config.image_features:
+                if img_key in batch:
+                    # Get the original image [B, C, H, W] or [C, H, W]
+                    orig_image = batch[img_key]
+
+                    # Create attention overlay
+                    # vision_attn: [1, 16, 256, 256]
+                    overlaid_image = visualize_attention_on_image(
+                        attention_weights=vision_attn,
+                        image=orig_image,
+                        patch_size=14,  # SigLIP patch size
+                        image_size=(224, 224),  # PI05 uses 224x224 images
+                    )
+
+                    # Store with descriptive key
+                    attention_maps[img_key] = overlaid_image
+
+        return self._action_queue.popleft(), attention_maps
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
