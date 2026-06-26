@@ -979,11 +979,8 @@ class PI05Policy(PreTrainedPolicy):
                 **kwargs,
             )
 
-        # Initialize model without loading weights
-        # Check if dataset_stats were provided in kwargs
-        model = cls(config, **kwargs)
-
         # Load state dict (expects keys with "model." prefix)
+        # Use meta-device init to skip redundant random initialization.
         try:
             print(f"Loading model from: {pretrained_name_or_path}")
             try:
@@ -1002,12 +999,23 @@ class PI05Policy(PreTrainedPolicy):
                 )
                 from safetensors.torch import load_file
 
-                original_state_dict = load_file(resolved_file)
-                print("✓ Loaded state dict from model.safetensors")
+                # Load weights directly onto the target device to avoid an
+                # extra .to() copy (especially beneficial for MPS/CUDA).
+                original_state_dict = load_file(resolved_file, device=str(config.device))
+                print(f"✓ Loaded state dict from model.safetensors (device={config.device})")
             except Exception as e:
                 print(f"Could not load state dict from remote files: {e}")
                 print("Returning model without loading pretrained weights")
-                return model
+                return cls(config, **kwargs)
+
+            # Build on meta device to skip random init of ~14.4 GB params.
+            target_device = config.device
+            config.device = "meta"
+            try:
+                with torch.device("meta"):
+                    model = cls(config, **kwargs)
+            finally:
+                config.device = target_device
 
             # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
@@ -1027,8 +1035,10 @@ class PI05Policy(PreTrainedPolicy):
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
 
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            # assign=True replaces meta tensors directly instead of copying.
+            missing_keys, unexpected_keys = model.load_state_dict(
+                remapped_state_dict, strict=strict, assign=True
+            )
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1053,8 +1063,42 @@ class PI05Policy(PreTrainedPolicy):
             if not missing_keys and not unexpected_keys:
                 print("All keys loaded successfully!")
 
+            # Materialize remaining meta buffers with proper initialization.
+            for module in model.modules():
+                meta_buf_names = [
+                    n for n, b in module._buffers.items() if b is not None and b.is_meta
+                ]
+                if not meta_buf_names:
+                    continue
+
+                # Leaf modules (no parameters, no children) can safely re-init
+                # to recompute deterministic buffers (e.g. RotaryEmbedding).
+                has_state = any(True for _ in module.parameters(recurse=False)) or any(
+                    True for _ in module.children()
+                )
+                if not has_state and hasattr(module, "config"):
+                    type(module).__init__(module, module.config, device=target_device)
+                    continue
+
+                # For other modules, compute buffer values from attributes.
+                for buf_name in meta_buf_names:
+                    buf = module._buffers[buf_name]
+                    if buf_name == "position_ids":
+                        module._buffers[buf_name] = torch.arange(
+                            buf.shape[-1], device=target_device
+                        ).unsqueeze(0)
+                    elif buf_name == "embed_scale" and hasattr(module, "embedding_dim"):
+                        module._buffers[buf_name] = torch.tensor(
+                            module.embedding_dim**0.5, device=target_device
+                        )
+                    else:
+                        module._buffers[buf_name] = torch.empty_like(
+                            buf, device=target_device
+                        )
+
         except Exception as e:
             print(f"Warning: Could not load state dict: {e}")
+            model = cls(config, **kwargs)
 
         return model
 
